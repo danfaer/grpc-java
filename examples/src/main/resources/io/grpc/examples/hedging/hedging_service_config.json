@@ -10,8 +10,10 @@
 
       "hedgingPolicy": {
         "maxAttempts": 3,
-        "hedgingDelay": "1s"
-      }
+        "hedgingDelay": "1s",
+        "nonFatalStatusCodes": ["UNAVAILABLE"]
+      },
+      "timeout": "15s"
     }
   ],
 

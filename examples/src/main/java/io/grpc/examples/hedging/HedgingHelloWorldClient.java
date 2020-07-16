@@ -16,24 +16,44 @@
 
 package io.grpc.examples.hedging;
 
-import static java.nio.charset.StandardCharsets.UTF_8;
-
+import com.google.common.base.Stopwatch;
 import com.google.gson.Gson;
 import com.google.gson.stream.JsonReader;
+
+import java.io.InputStreamReader;
+import java.util.Map;
+import java.util.UUID;
+import java.util.concurrent.ForkJoinPool;
+import java.util.concurrent.PriorityBlockingQueue;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.logging.Level;
+import java.util.logging.Logger;
+
+import javax.annotation.Nonnull;
+import javax.annotation.Nullable;
+
+import io.grpc.CallOptions;
+import io.grpc.Channel;
+import io.grpc.ClientCall;
+import io.grpc.ClientInterceptor;
+import io.grpc.ClientStreamTracer;
+import io.grpc.ForwardingClientCall;
+import io.grpc.ForwardingClientCallListener;
 import io.grpc.ManagedChannel;
 import io.grpc.ManagedChannelBuilder;
+import io.grpc.Metadata;
+import io.grpc.MethodDescriptor;
+import io.grpc.Status;
 import io.grpc.StatusRuntimeException;
 import io.grpc.examples.helloworld.GreeterGrpc;
 import io.grpc.examples.helloworld.HelloReply;
 import io.grpc.examples.helloworld.HelloRequest;
-import java.io.InputStreamReader;
-import java.util.Map;
-import java.util.concurrent.ForkJoinPool;
-import java.util.concurrent.PriorityBlockingQueue;
-import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicInteger;
-import java.util.logging.Level;
-import java.util.logging.Logger;
+
+import static io.grpc.Metadata.ASCII_STRING_MARSHALLER;
+import static java.nio.charset.StandardCharsets.UTF_8;
+
 
 /**
  * A client that requests a greeting from the {@link HedgingHelloWorldServer} with a hedging policy.
@@ -68,10 +88,124 @@ public class HedgingHelloWorldClient {
     if (hedging) {
       channelBuilder.defaultServiceConfig(hedgingServiceConfig).enableRetry();
     }
+    channelBuilder.intercept(new StatsClientInterceptor());
     channel = channelBuilder.build();
     blockingStub = GreeterGrpc.newBlockingStub(channel);
     this.hedging = hedging;
   }
+
+    private static final Metadata.Key<String> GRPC_PREVIOUS_RPC_ATTEMPTS =
+        Metadata.Key.of("grpc-previous-rpc-attempts", Metadata.ASCII_STRING_MARSHALLER);
+
+    public static final Metadata.Key<String> GRPC_CALL_ID = Metadata.Key.of("grpc-call-id", ASCII_STRING_MARSHALLER);
+
+
+    private static final class ClientTracer extends ClientStreamTracer {
+
+        private final String callId;
+        private final Stopwatch stopWatch;
+        private final AtomicBoolean streamClosed = new AtomicBoolean(false);
+        private final int attemptNumber;
+
+        ClientTracer(int attemptNumber,
+                     @Nullable String callId,
+                     @Nonnull Stopwatch stopWatch) {
+            this.attemptNumber = attemptNumber;
+            this.callId = callId;
+            this.stopWatch = stopWatch.start();
+
+            logger.log(Level.INFO,"Client stream started. callId={0} attempt={1}", new Object[]{callId, attemptNumber});
+        }
+
+        @Override
+        public void streamClosed(Status status) {
+
+            if (streamClosed.getAndSet(true)) {
+                return;
+            }
+
+            stopWatch.stop();
+
+            long roundtripMillis = stopWatch.elapsed(TimeUnit.MILLISECONDS);
+
+            Level level;
+            if (status.isOk()) {
+                level = Level.INFO;
+            } else {
+                level = Level.SEVERE;
+            }
+
+            logger.log(level,
+                       "Client stream closed. callId={0} time={1} attempt={2} closed with tracerStatus={3}",
+                       new Object[]{callId, roundtripMillis, attemptNumber, status});
+        }
+
+    }
+
+    static final class ClientCallTracerFactory extends ClientStreamTracer.Factory {
+
+        @Override
+        public ClientStreamTracer newClientStreamTracer(ClientStreamTracer.StreamInfo info, Metadata headers) {
+
+            int previousAttempts = getPreviousAttempts(headers);
+            final String callId = headers.get(GRPC_CALL_ID);
+            return new ClientTracer(previousAttempts + 1,
+                                    callId,
+                                    Stopwatch.createUnstarted());
+        }
+    }
+
+    public static int getPreviousAttempts(Metadata trailers) {
+        String previousAttemptsStr = trailers.get(GRPC_PREVIOUS_RPC_ATTEMPTS);
+        int previousAttempts = 0;
+        if (previousAttemptsStr != null) {
+            previousAttempts = Integer.parseInt(previousAttemptsStr);
+        }
+        return previousAttempts;
+    }
+
+    static final class StatsClientInterceptor implements ClientInterceptor {
+
+        @Override
+        public <ReqT, RespT> ClientCall<ReqT, RespT> interceptCall(MethodDescriptor<ReqT, RespT> method,
+                                                                   CallOptions callOptions,
+                                                                   Channel next) {
+
+            final ClientCallTracerFactory tracerFactory = new ClientCallTracerFactory();
+
+            ClientCall<ReqT, RespT> call = next.newCall(method, callOptions.withStreamTracerFactory(tracerFactory));
+
+            return new ForwardingClientCall.SimpleForwardingClientCall<>(call) {
+                @Override
+                public void start(ClientCall.Listener<RespT> responseListener, Metadata headers) {
+
+                    final long start = System.currentTimeMillis();
+
+                    final String callId = UUID.randomUUID().toString();
+                    headers.put(GRPC_CALL_ID, callId);
+
+                    super.start(
+                        new ForwardingClientCallListener.SimpleForwardingClientCallListener<>(responseListener) {
+                            @Override
+                            public void onClose(Status status, Metadata trailers) {
+
+                                Level level;
+                                if (status.isOk()) {
+                                    level = Level.INFO;
+                                } else {
+                                    level = Level.SEVERE;
+                                }
+                                logger.log(level,
+                                    "Client call finished. callId={0} time={1} status={2}",
+                                    new Object[] {callId, (System.currentTimeMillis() - start), status});
+
+                                super.onClose(status, trailers);
+                            }
+                        }, headers);
+                }
+            };
+        }
+    }
 
   public void shutdown() throws InterruptedException {
     channel.shutdown().awaitTermination(5, TimeUnit.SECONDS);
@@ -165,6 +299,7 @@ public class HedgingHelloWorldClient {
   }
 
   public static void main(String[] args) throws Exception {
+    System.setProperty("java.util.logging.SimpleFormatter.format", "[%1$tF %1$tT] [%4$-7s] %5$s %n");
     boolean hedging = !Boolean.parseBoolean(System.getenv(ENV_DISABLE_HEDGING));
     final HedgingHelloWorldClient client = new HedgingHelloWorldClient("localhost", 50051, hedging);
     ForkJoinPool executor = new ForkJoinPool();

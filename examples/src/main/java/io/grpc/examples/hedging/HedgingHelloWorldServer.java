@@ -23,6 +23,7 @@ import io.grpc.ServerCall;
 import io.grpc.ServerCall.Listener;
 import io.grpc.ServerCallHandler;
 import io.grpc.ServerInterceptor;
+import io.grpc.Status;
 import io.grpc.examples.helloworld.GreeterGrpc;
 import io.grpc.examples.helloworld.HelloReply;
 import io.grpc.examples.helloworld.HelloRequest;
@@ -110,8 +111,9 @@ public class HedgingHelloWorldServer {
         delay = 10_000;
       } else if (random < 5) {
         delay = 5_000;
-      } else if (random < 10) {
-        delay = 2_000;
+      } else if (random < 40) {
+        call.close(Status.UNAVAILABLE, new Metadata());
+        return new ServerCall.Listener<HelloRequestT>() {};
       }
 
       if (delay > 0) {
